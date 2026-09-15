@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
@@ -549,6 +550,170 @@ def save_map():
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+# Файли для статистики та адміна
+ADMIN_FILE = os.getenv("ADMIN_FILE", "admin.json")
+STATS_FILE = os.getenv("STATS_FILE", "stats.json")
+
+
+def get_admin():
+    if ADMIN_ID:
+        return ADMIN_ID
+    try:
+        with open(ADMIN_FILE, "r", encoding="utf-8") as f:
+            return int(json.load(f).get("id", 0))
+    except Exception:
+        return 0
+
+
+def set_admin(uid):
+    with open(ADMIN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"id": uid}, f, ensure_ascii=False, indent=2)
+
+
+def load_stats():
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_stats(stats):
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def record_stat(uid, username, full_name, thread_id, category):
+    stats = load_stats()
+    stats.append({
+        "uid": uid,
+        "username": username,
+        "full_name": full_name,
+        "thread_id": thread_id,
+        "category": category,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_stats(stats)
+
+
+def build_stat_text(start_dt, end_dt):
+    stats = load_stats()
+    users = {}
+    total = 0
+    for e in stats:
+        try:
+            ts = datetime.fromisoformat(e["ts"])
+        except Exception:
+            continue
+        if start_dt and ts < start_dt:
+            continue
+        if end_dt and ts > end_dt.replace(hour=23, minute=59, second=59):
+            continue
+        uid = e["uid"]
+        u = users.setdefault(uid, {
+            "name": e.get("full_name", ""),
+            "username": e.get("username", ""),
+            "count": 0,
+            "dates": {},
+            "cats": {},
+        })
+        u["count"] += 1
+        d = ts.strftime("%d.%m.%Y")
+        u["dates"][d] = u["dates"].get(d, 0) + 1
+        cat = e.get("category", "?")
+        u["cats"][cat] = u["cats"].get(cat, 0) + 1
+        total += 1
+    if not users:
+        return "📭 За цей період оголошень не було."
+
+    lines = [
+        "📊 <b>Статистика оголошень</b>",
+        f"Період: {start_dt.strftime('%d.%m.%Y')} – {end_dt.strftime('%d.%m.%Y')}" if start_dt and end_dt else "Весь період",
+        f"Всього оголошень: {total} · Учасників: {len(users)}",
+        "",
+    ]
+    for i, (uid, u) in enumerate(sorted(users.items(), key=lambda x: -x[1]["count"]), 1):
+        who = f"@{u['username']}" if u["username"] else (u["name"] or f"id{uid}")
+        lines.append(f"{i}) {who}")
+        lines.append(f"   🗂 Оголошень: {u['count']}")
+        dates = ", ".join(f"{d} ({n})" for d, n in sorted(u["dates"].items()))
+        lines.append(f"   🗓 {dates}")
+        cats = ", ".join(f"{CATEGORY_LABELS.get(c, c)} ({n})" for c, n in sorted(u["cats"].items(), key=lambda x: -x[1]))
+        lines.append(f"   📂 {cats}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def stat_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🕒 Останні 7 днів", callback_data="stat:7d")],
+        [InlineKeyboardButton("📆 Цей місяць", callback_data="stat:month")],
+        [InlineKeyboardButton("🗓 Весь час", callback_data="stat:all")],
+        [InlineKeyboardButton("📅 Свій період", callback_data="stat:custom")],
+    ])
+
+
+async def cmd_set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if chat.type != "private" or not msg.from_user:
+        return
+    user_id = msg.from_user.id
+    args = context.args or []
+    if len(args) != 1 or not args[0].isdigit():
+        await msg.reply_text("Використання: /set_admin <id>\nПриклад: /set_admin 123456789")
+        return
+    new_id = int(args[0])
+    current = get_admin()
+    if current and user_id != current:
+        await msg.reply_text("❌ Немає доступу.")
+        return
+    set_admin(new_id)
+    await msg.reply_text(f"✅ Адміна встановлено: {new_id}")
+
+
+async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if chat.type != "private" or not msg.from_user:
+        return
+    admin_id = get_admin()
+    if not admin_id or msg.from_user.id != admin_id:
+        await msg.reply_text(
+            "❌ Немає доступу.\n"
+            "Введіть /set_admin <ваш_id> щоб стати адміном."
+        )
+        return
+    await msg.reply_text("📊 Статистика оголошень.\nОберіть період:", reply_markup=stat_buttons())
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or chat.type not in ("group", "supergroup"):
+        return
+    if not msg.new_chat_members:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
+        logger.info("Deleted join message chat=%s msg=%s", chat.id, msg.message_id)
+    except Exception as e:
+        logger.warning("Could not delete join message: %s", e)
+
+
+def parse_dates(text):
+    found = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", text)
+    if len(found) >= 2:
+        try:
+            d1 = datetime(int(found[0][2]), int(found[0][1]), int(found[0][0]))
+            d2 = datetime(int(found[-1][2]), int(found[-1][1]), int(found[-1][0]))
+            if d1 > d2:
+                d1, d2 = d2, d1
+            return d1, d2
+        except ValueError:
+            return None
+    return None
+
 
 async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -556,7 +721,8 @@ async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type != "private" or not msg.from_user:
         return
     user_id = msg.from_user.id
-    if ADMIN_ID and user_id != ADMIN_ID:
+    admin_id = get_admin()
+    if admin_id and user_id != admin_id:
         await msg.reply_text("❌ Немає доступу.")
         return
     parts = (context.args or [])
@@ -705,6 +871,16 @@ async def priv_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     state = get_user_state(context)
 
+    if context.user_data.get("stat_dates"):
+        parsed = parse_dates(text)
+        if not parsed:
+            await msg.reply_text("❌ Не зрозумів дати. Формат: 01.01.2025 31.12.2025")
+            return
+        context.user_data.pop("stat_dates", None)
+        d1, d2 = parsed
+        await msg.reply_text(build_stat_text(d1, d2), parse_mode="HTML")
+        return
+
     if text.lower() in ("/cancel", "скасувати", "стоп"):
         set_user_state(context, {"phase": "idle", "data": {}, "photos": []})
         await msg.reply_text("❌ Скасовано.")
@@ -761,6 +937,33 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(context)
 
     logger.info("CALLBACK: user=%s data=%s phase=%s", uid, data, state.get("phase"))
+
+    if data.startswith("stat:"):
+        admin_id = get_admin()
+        if not admin_id or q.from_user.id != admin_id:
+            await q.edit_message_text("❌ Немає доступу.")
+            return
+        mode = data.split(":", 1)[1]
+        now = datetime.now()
+        if mode == "7d":
+            start = now - timedelta(days=7)
+            await q.edit_message_text(build_stat_text(start, now), parse_mode="HTML")
+        elif mode == "month":
+            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            await q.edit_message_text(build_stat_text(start, now), parse_mode="HTML")
+        elif mode == "all":
+            await q.edit_message_text(build_stat_text(None, None), parse_mode="HTML")
+        elif mode == "custom":
+            context.user_data["stat_dates"] = True
+            await q.edit_message_text(
+                "📅 Введіть період двома датами (інтервалом).\n"
+                "Приклад:\n"
+                "01.01.2025 31.12.2025\n"
+                "або 10.03.2025 – 15.03.2025"
+            )
+        else:
+            await q.edit_message_text("❌ Невідома команда.")
+        return
 
     if data.startswith("sel:"):
         tid = int(data.split(":")[1])
@@ -886,6 +1089,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.edit_message_text("✅ Оголошення опубліковано!")
 
+        record_stat(
+            uid,
+            state["data"].get("author_username", ""),
+            state["data"].get("author_name", ""),
+            thread_id,
+            category,
+        )
+
         button_msg_id = state.get("_button_msg_id")
         button_chat_id = state.get("_button_chat_id")
         if button_msg_id and button_chat_id:
@@ -919,7 +1130,10 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("map", cmd_map))
+    app.add_handler(CommandHandler("set_admin", cmd_set_admin))
+    app.add_handler(CommandHandler("stat", cmd_stat))
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, priv_photo))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, priv_text))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message))
