@@ -111,6 +111,10 @@ CITIES = [
 BOT_USERNAME = None
 BOT_USER_ID = None
 
+# Cooldown: ліміт оголошень на користувача в гілці
+COOLDOWN_LIMIT = 5
+COOLDOWN_PERIOD = timedelta(days=1)
+
 
 POST_TEMPLATES = {
     "одяг": [
@@ -331,6 +335,15 @@ def build_post(data, category):
     return "\n".join(lines)
 
 
+def build_del_kb(ads):
+    if not ads:
+        return InlineKeyboardMarkup([])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑 {ad.get('title') or 'Оголошення'}", callback_data=f"del_pick:{i}")]
+        for i, ad in enumerate(ads)
+    ])
+
+
 def action_buttons():
     return InlineKeyboardMarkup([
         [
@@ -338,6 +351,7 @@ def action_buttons():
             InlineKeyboardButton("❌ Скасувати", callback_data="cancel"),
         ],
         [InlineKeyboardButton("✏️ Редагувати", callback_data="edit_menu")],
+        [InlineKeyboardButton("🗑 Видалити оголошення", callback_data="del")],
     ])
 
 
@@ -797,7 +811,8 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = await msg.chat.send_message(
         "🤖 Хочете продати товар?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Створити оголошення", url=link)]
+            [InlineKeyboardButton("➕ Створити оголошення", url=link)],
+            [InlineKeyboardButton("🗑 Видалити оголошення", callback_data="del")],
         ]),
         message_thread_id=thread_id,
     )
@@ -1056,10 +1071,30 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_text = build_post(state["data"], category)
         photos = state.get("photos", [])
 
+        ads_list = context.user_data.get("ads") or []
+        published_now = 0
+        now_dt = datetime.now()
+        for a in ads_list:
+            try:
+                ts = datetime.fromisoformat(str(a.get("ts") or ""))
+            except Exception:
+                continue
+            if (a.get("chat_id") == chat_id and a.get("thread_id") == thread_id
+                    and now_dt - ts < COOLDOWN_PERIOD):
+                published_now += 1
+
+        if published_now >= COOLDOWN_LIMIT:
+            await q.edit_message_text(
+                f"⏳ Ви вже опублікували <b>{published_now}</b> оголошень у цій гілці за останні 24 години.\n"
+                f"Обмеження: до <b>{COOLDOWN_LIMIT}</b> оголошень на користувача в гілці. Наразі нове оголошення не можна опублікувати."
+            )
+            return
+
         try:
+            sent_msg = None
             if photos:
                 if len(photos) == 1:
-                    await context.bot.send_photo(
+                    sent_msg = await context.bot.send_photo(
                         chat_id=chat_id,
                         photo=photos[0],
                         caption=post_text,
@@ -1070,24 +1105,40 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     media = [InputMediaPhoto(photos[0], caption=post_text, parse_mode="HTML")]
                     for p in photos[1:]:
                         media.append(InputMediaPhoto(p))
-                    await context.bot.send_media_group(
+                    resp = await context.bot.send_media_group(
                         chat_id=chat_id,
                         media=media,
                         message_thread_id=thread_id,
                     )
+                    sent_msg = resp[0] if isinstance(resp, (tuple, list)) and len(resp) > 0 else None
             else:
-                await context.bot.send_message(
+                sent_msg = await context.bot.send_message(
                     chat_id=chat_id,
                     text=post_text,
                     parse_mode="HTML",
                     message_thread_id=thread_id,
                 )
+            sent_id = sent_msg.message_id if sent_msg else None
         except Exception as e:
             logger.error("PUBLISH ERROR: %s", e)
             await q.edit_message_text(f"⚠️ Помилка публікації: {e}")
             return
 
-        await q.edit_message_text("✅ Оголошення опубліковано!")
+        context.user_data.setdefault("ads", []).append({
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": sent_id,
+            "post_text": post_text,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "category": category,
+        })
+
+        await q.edit_message_text(
+            "✅ Оголошення опубліковано!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Видалити оголошення", callback_data="del")],
+            ]),
+        )
 
         record_stat(
             uid,
@@ -1112,6 +1163,98 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         set_user_state(context, {"phase": "idle", "data": {}, "photos": []})
         await q.edit_message_text("❌ Скасовано.")
+        return
+
+    if data == "del":
+        ads = context.user_data.get("ads") or []
+        if not ads:
+            await q.edit_message_text("🗑 У вас поки немає опублікованих оголошень.")
+            return
+        await q.edit_message_text(
+            "🗑 <b>Оберіть оголошення для видалення</b>",
+            reply_markup=build_del_kb(ads),
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("del_pick:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+        except Exception:
+            await q.edit_message_text("❌ Помилка.")
+            return
+        ads = context.user_data.get("ads") or []
+        if idx < 0 or idx >= len(ads):
+            await q.edit_message_text("❌ Оголошення не знайдено.")
+            return
+        context.user_data["del_state"] = {"ads": ads, "idx": idx}
+        ad = ads[idx]
+        await q.edit_message_text(
+            f"🗑 <b>Видалити це оголошення?</b>\n\n{ad.get('title') or 'Оголошення'}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Так", callback_data="del_yes")],
+                [InlineKeyboardButton("❌ Ні", callback_data="del_no")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "del_yes" or data.startswith("del_yes:"):
+        st = context.user_data.get("del_state") or {}
+        ads = st.get("ads") or context.user_data.get("ads") or []
+        idx = st.get("idx")
+        ad = None
+        if isinstance(idx, int) and 0 <= idx < len(ads):
+            ad = ads[idx]
+        if not ad:
+            context.user_data.pop("del_state", None)
+            await q.edit_message_text("❌ Оголошення не знайдено.")
+            return
+        deleted_ok = True
+        try:
+            await context.bot.delete_message(
+                chat_id=ad.get("chat_id"),
+                message_id=ad.get("message_id"),
+                message_thread_id=ad.get("thread_id"),
+            )
+            logger.info("AD DELETED: user=%s chat=%s thread=%s msg=%s",
+                        q.from_user.id, ad.get("chat_id"), ad.get("thread_id"), ad.get("message_id"))
+        except Exception as e:
+            deleted_ok = False
+            logger.warning("AD DELETE ERROR: %s", e)
+        if deleted_ok:
+            user_ads = context.user_data.get("ads") or []
+            context.user_data["ads"] = [
+                a for a in user_ads
+                if not (a.get("chat_id") == ad.get("chat_id")
+                        and a.get("thread_id") == ad.get("thread_id")
+                        and a.get("message_id") == ad.get("message_id"))
+            ]
+        context.user_data.pop("del_state", None)
+        new_ads = context.user_data.get("ads") or []
+        if new_ads:
+            await q.edit_message_text(
+                "🗑 <b>Оберіть оголошення для видалення</b>",
+                reply_markup=build_del_kb(new_ads),
+                parse_mode="HTML",
+            )
+        elif deleted_ok:
+            await q.edit_message_text("✅ Оголошення видалено!")
+        else:
+            await q.edit_message_text("⚠️ Не вдалося видалити оголошення.")
+        return
+
+    if data == "del_no" or data.startswith("del_no:"):
+        context.user_data.pop("del_state", None)
+        ads = context.user_data.get("ads") or []
+        if ads:
+            await q.edit_message_text(
+                "🗑 <b>Оберіть оголошення для видалення</b>",
+                reply_markup=build_del_kb(ads),
+                parse_mode="HTML",
+            )
+        else:
+            await q.edit_message_text("📭 У вас поки немає опублікованих оголошень.")
         return
 
 
