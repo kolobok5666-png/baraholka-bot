@@ -449,17 +449,24 @@ async def analyze_and_respond(msg, state, context):
     if not state.get("photos"):
         missing.append("photo")
     if not missing:
+        context.user_data["last_missing"] = None
         await show_draft(msg, state, context)
-    else:
-        labels = [FIELD_LABELS.get(f, "📸 Фото") for f in missing]
-        skip_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ Пропустити", callback_data="skip_fields")]
-        ])
-        text = "👍 Оголошення майже готове!\n\nНе вистачає:\n"
-        for l in labels:
-            text += f"  {l}\n"
-        text += "\nНапишіть ці дані або натисніть «Пропустити»."
-        await msg.reply_text(text, reply_markup=skip_kb)
+        return
+
+    missing_key = tuple(missing)
+    if context.user_data.get("last_missing") == missing_key:
+        return
+    context.user_data["last_missing"] = missing_key
+
+    labels = [FIELD_LABELS.get(f, "📸 Фото") for f in missing]
+    skip_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустити", callback_data="skip_fields")]
+    ])
+    text = "👍 Оголошення майже готове!\n\nНе вистачає:\n"
+    for l in labels:
+        text += f"  {l}\n"
+    text += "\nНапишіть ці дані або натисніть «Пропустити»."
+    await msg.reply_text(text, reply_markup=skip_kb)
 
 
 async def show_draft(msg, state, context):
@@ -527,6 +534,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             set_user_state(context, state)
 
+            context.user_data["last_missing"] = None
             cat_label = CATEGORY_LABELS.get(category, category)
             await msg.reply_text(
                 f"✅ Гілка «{cat_label}» запам'ятована!\n\n"
